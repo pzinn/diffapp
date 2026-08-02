@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import math
 import sys
 from pathlib import Path
@@ -17,6 +19,14 @@ from .core import (
 )
 from .io import read_legacy_dataset, read_plain_coefficients
 from .model import ApproximantError, Singularity
+from .sweep import (
+    RootCluster,
+    SweepConfig,
+    SweepEstimate,
+    SweepResult,
+    SweepSpecification,
+    run_sweep,
+)
 
 
 def _format_number(value: Any, digits: int = 12) -> str:
@@ -128,58 +138,300 @@ def _fit_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _sweep_command(arguments: argparse.Namespace) -> int:
-    dataset = read_legacy_dataset(arguments.path)
-    produced = 0
-    rejected = 0
-    for q_degrees, p_degree in dataset.sweep.specifications():
-        needed = required_coefficients(q_degrees, p_degree)
-        if needed > len(dataset.coefficients):
-            continue
-        try:
-            approximant = fit_differential_approximant(
-                dataset.coefficients,
-                q_degrees,
-                p_degree,
-                backend=arguments.backend,
-                precision_digits=arguments.precision,
-            )
-            physical = approximant.physical_singularity(
-                arguments.imaginary_tolerance,
-                (arguments.root_min, arguments.root_max),
-            )
-        except ApproximantError as error:
-            rejected += 1
-            if arguments.verbose:
-                print(f"rejected Q={q_degrees}, P={p_degree}: {error}", file=sys.stderr)
-            continue
-        if physical is None:
-            rejected += 1
-            continue
-        exponent = (
-            "?"
-            if physical.exponent is None
-            else _format_number(physical.exponent, arguments.digits)
-        )
-        condition = approximant.diagnostics.scaled_condition_number
-        condition_text = (
-            "n/a"
-            if condition is None or not math.isfinite(condition)
-            else f"{condition:.2e}"
-        )
-        cancellation_text = (
-            f"{physical.common_factor_residual:.1e}"
-            if physical.common_factor_residual is not None
-            else "n/a"
-        )
+def _integer_selection(value: str) -> tuple[int, ...]:
+    """Parse comma-separated integers and inclusive ``start:stop`` ranges."""
+
+    selected: list[int] = []
+    try:
+        for part in value.split(","):
+            token = part.strip()
+            if not token:
+                raise ValueError
+            if ":" not in token:
+                selected.append(int(token))
+                continue
+            endpoints = token.split(":")
+            if len(endpoints) != 2:
+                raise ValueError
+            start, stop = (int(endpoint) for endpoint in endpoints)
+            step = 1 if stop >= start else -1
+            selected.extend(range(start, stop + step, step))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers or inclusive ranges such as 0:8"
+        ) from error
+    return tuple(dict.fromkeys(selected))
+
+
+def _root_interval(arguments: argparse.Namespace) -> tuple[float, float] | None:
+    if arguments.root_min is None and arguments.root_max is None:
+        return None
+    return (
+        -math.inf if arguments.root_min is None else arguments.root_min,
+        math.inf if arguments.root_max is None else arguments.root_max,
+    )
+
+
+def _sweep_config(arguments: argparse.Namespace) -> SweepConfig:
+    return SweepConfig(
+        orders=arguments.orders,
+        p_degrees=arguments.p_degrees,
+        degree_spread=arguments.degree_spread,
+        max_terms_omitted=arguments.max_terms_omitted,
+        root_interval=_root_interval(arguments),
+        imaginary_tolerance=arguments.imaginary_tolerance,
+        cluster_tolerance=arguments.cluster_tolerance,
+        minimum_cluster_fraction=arguments.minimum_cluster_fraction,
+        reject_rank_deficient=not arguments.include_rank_deficient,
+    )
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    converted = float(value)
+    return converted if math.isfinite(converted) else None
+
+
+def _complex_record(value: Any | None) -> dict[str, float | None] | None:
+    if value is None:
+        return None
+    converted = complex(value)
+    return {
+        "real": _finite_float(converted.real),
+        "imag": _finite_float(converted.imag),
+    }
+
+
+def _specification_record(specification: SweepSpecification) -> dict[str, Any]:
+    return {
+        "order": specification.order,
+        "q_degrees": list(specification.q_degrees),
+        "p_degree": specification.p_degree,
+        "coefficients_used": specification.coefficients_used,
+    }
+
+
+def _estimate_record(estimate: SweepEstimate) -> dict[str, Any]:
+    diagnostics = estimate.approximant.diagnostics
+    singularity = estimate.singularity
+    return {
+        **_specification_record(estimate.specification),
+        "root": _complex_record(singularity.root),
+        "exponent": _complex_record(singularity.exponent),
+        "condition_number": _finite_float(diagnostics.scaled_condition_number),
+        "numerical_rank": diagnostics.numerical_rank,
+        "relative_residual": _finite_float(diagnostics.relative_residual),
+        "cancellation_max": _finite_float(singularity.common_factor_residual),
+        "common_root_distance": _finite_float(singularity.common_root_distance),
+        "gcd_svd": _finite_float(singularity.sylvester_gcd_score),
+    }
+
+
+def _cluster_record(cluster: RootCluster) -> dict[str, Any]:
+    return {
+        "root": _complex_record(cluster.root),
+        "root_spread": _finite_float(cluster.root_spread),
+        "exponent": _complex_record(cluster.exponent),
+        "exponent_spread": _finite_float(cluster.exponent_spread),
+        "approximant_support": cluster.approximant_support,
+        "support_fraction": cluster.support_fraction,
+        "orders": list(cluster.orders),
+        "recurring": cluster.recurring,
+    }
+
+
+def _print_estimate(estimate: SweepEstimate, digits: int) -> None:
+    specification = estimate.specification
+    singularity = estimate.singularity
+    exponent = (
+        "?"
+        if singularity.exponent is None
+        else _format_number(singularity.exponent, digits)
+    )
+    condition = estimate.approximant.diagnostics.scaled_condition_number
+    condition_text = (
+        "n/a"
+        if condition is None or not math.isfinite(condition)
+        else f"{condition:.2e}"
+    )
+    cancellation_text = (
+        f"{singularity.common_factor_residual:.1e}"
+        if singularity.common_factor_residual is not None
+        else "n/a"
+    )
+    print(
+        f"Q={specification.q_degrees} P={specification.p_degree:2d} "
+        f"used={specification.coefficients_used:2d} "
+        f"x={_format_number(singularity.root, digits):>16} "
+        f"theta={exponent:>16} cond={condition_text} max={cancellation_text}"
+    )
+
+
+def _reported_clusters(
+    result: SweepResult, show_all_clusters: bool
+) -> tuple[RootCluster, ...]:
+    return result.clusters if show_all_clusters else result.recurring_clusters
+
+
+def _write_sweep_table(result: SweepResult, arguments: argparse.Namespace) -> None:
+    accepted = len(result.accepted_specifications)
+    print(
+        f"{len(result.specifications)} specifications: {accepted} accepted, "
+        f"{len(result.rejections)} rejected; {len(result.estimates)} root estimates"
+    )
+    if arguments.show_approximants:
+        print("\nApproximant estimates:")
+        for estimate in result.estimates:
+            _print_estimate(estimate, arguments.digits)
+
+    clusters = _reported_clusters(result, arguments.all_clusters)
+    heading = (
+        "All root clusters"
+        if arguments.all_clusters
+        else "Recurring root clusters"
+    )
+    print(f"\n{heading}:")
+    if not clusters:
+        print("none")
+    else:
         print(
-            f"Q={q_degrees} P={p_degree:2d} used={needed:2d} "
-            f"x={_format_number(physical.root, arguments.digits):>16} "
-            f"theta={exponent:>16} cond={condition_text} "
-            f"cancel={cancellation_text}"
+            f"{'root':>18} {'theta':>18} {'root spread':>12} "
+            f"{'theta spread':>12} {'support':>9} {'fraction':>9} {'orders':>8}"
         )
-        produced += 1
-    print(f"{produced} approximants reported; {rejected} rejected", file=sys.stderr)
+        for cluster in clusters:
+            exponent = (
+                "?"
+                if cluster.exponent is None
+                else _format_number(cluster.exponent, arguments.digits)
+            )
+            exponent_spread = (
+                "n/a"
+                if cluster.exponent_spread is None
+                else f"{cluster.exponent_spread:.2e}"
+            )
+            orders = ",".join(str(order) for order in cluster.orders)
+            print(
+                f"{_format_number(cluster.root, arguments.digits):>18} "
+                f"{exponent:>18} {cluster.root_spread:12.2e} "
+                f"{exponent_spread:>12} {cluster.approximant_support:9d} "
+                f"{cluster.support_fraction:9.1%} {orders:>8}"
+            )
+
+    if arguments.verbose and result.rejections:
+        print("\nRejected specifications:", file=sys.stderr)
+        for rejection in result.rejections:
+            detail = f": {rejection.detail}" if rejection.detail else ""
+            print(
+                f"Q={rejection.specification.q_degrees} "
+                f"P={rejection.specification.p_degree}: {rejection.reason}{detail}",
+                file=sys.stderr,
+            )
+
+
+def _write_sweep_json(result: SweepResult, arguments: argparse.Namespace) -> None:
+    payload = {
+        "summary": {
+            "specifications": len(result.specifications),
+            "accepted": len(result.accepted_specifications),
+            "rejected": len(result.rejections),
+            "root_estimates": len(result.estimates),
+            "clusters": len(result.clusters),
+            "recurring_clusters": len(result.recurring_clusters),
+        },
+        "clusters": [
+            _cluster_record(cluster)
+            for cluster in _reported_clusters(result, arguments.all_clusters)
+        ],
+        "estimates": [
+            _estimate_record(estimate) for estimate in result.estimates
+        ],
+        "rejections": [
+            {
+                **_specification_record(rejection.specification),
+                "reason": rejection.reason,
+                "detail": rejection.detail,
+            }
+            for rejection in result.rejections
+        ],
+    }
+    json.dump(payload, sys.stdout, indent=2, allow_nan=False)
+    print()
+
+
+def _write_sweep_csv(result: SweepResult, arguments: argparse.Namespace) -> None:
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        (
+            "root_real",
+            "root_imag",
+            "root_spread",
+            "exponent_real",
+            "exponent_imag",
+            "exponent_spread",
+            "approximant_support",
+            "support_fraction",
+            "orders",
+            "recurring",
+        )
+    )
+    for cluster in _reported_clusters(result, arguments.all_clusters):
+        exponent = cluster.exponent
+        writer.writerow(
+            (
+                cluster.root.real,
+                cluster.root.imag,
+                cluster.root_spread,
+                "" if exponent is None else exponent.real,
+                "" if exponent is None else exponent.imag,
+                "" if cluster.exponent_spread is None else cluster.exponent_spread,
+                cluster.approximant_support,
+                cluster.support_fraction,
+                ";".join(str(order) for order in cluster.orders),
+                str(cluster.recurring).lower(),
+            )
+        )
+
+
+def _report_sweep(result: SweepResult, arguments: argparse.Namespace) -> None:
+    if arguments.output == "json":
+        _write_sweep_json(result, arguments)
+    elif arguments.output == "csv":
+        _write_sweep_csv(result, arguments)
+    else:
+        _write_sweep_table(result, arguments)
+
+
+def _modern_sweep_command(arguments: argparse.Namespace) -> int:
+    coefficients = (
+        read_legacy_dataset(arguments.path).coefficients
+        if arguments.format == "legacy"
+        else read_plain_coefficients(arguments.path)
+    )
+    result = run_sweep(
+        coefficients,
+        _sweep_config(arguments),
+        backend=arguments.backend,
+        precision_digits=arguments.precision,
+    )
+    _report_sweep(result, arguments)
+    return 0
+
+
+def _legacy_sweep_command(arguments: argparse.Namespace) -> int:
+    dataset = read_legacy_dataset(arguments.path)
+    specifications = tuple(
+        SweepSpecification(q_degrees, p_degree)
+        for q_degrees, p_degree in dataset.sweep.specifications()
+    )
+    result = run_sweep(
+        dataset.coefficients,
+        _sweep_config(arguments),
+        specifications=specifications,
+        backend=arguments.backend,
+        precision_digits=arguments.precision,
+    )
+    _report_sweep(result, arguments)
     return 0
 
 
@@ -214,26 +466,101 @@ def build_parser() -> argparse.ArgumentParser:
     _backend_arguments(fit_parser)
     fit_parser.set_defaults(handler=_fit_command)
 
+    def add_sweep_arguments(
+        sweep_parser: argparse.ArgumentParser, *, generated: bool
+    ) -> None:
+        if generated:
+            sweep_parser.add_argument(
+                "--orders",
+                type=_integer_selection,
+                default=(1, 2),
+                help=(
+                    "equation orders, as integers or inclusive ranges "
+                    "(default: 1,2)"
+                ),
+            )
+            sweep_parser.add_argument(
+                "--p-degrees",
+                type=_integer_selection,
+                help="P degrees, e.g. 0:8 or -1,0,1 (default: automatic range)",
+            )
+            sweep_parser.add_argument(
+                "--degree-spread",
+                type=int,
+                default=2,
+                help="maximum degree difference among Q polynomials (default: 2)",
+            )
+            sweep_parser.add_argument(
+                "--max-terms-omitted",
+                type=int,
+                help="generate fits omitting at most this many trailing coefficients",
+            )
+        sweep_parser.add_argument("--imaginary-tolerance", type=float, default=1.0e-8)
+        sweep_parser.add_argument(
+            "--root-min", type=float, help="lower end of the selected real-root interval"
+        )
+        sweep_parser.add_argument(
+            "--root-max", type=float, help="upper end of the selected real-root interval"
+        )
+        sweep_parser.add_argument(
+            "--cluster-tolerance",
+            type=float,
+            default=1.0e-4,
+            help="relative distance used to group roots (default: 1e-4)",
+        )
+        sweep_parser.add_argument(
+            "--minimum-cluster-fraction",
+            type=float,
+            default=0.5,
+            help="accepted-fit fraction required for a recurring cluster (default: 0.5)",
+        )
+        sweep_parser.add_argument(
+            "--include-rank-deficient",
+            action="store_true",
+            help="retain fits whose scaled linear systems are rank deficient",
+        )
+        sweep_parser.add_argument(
+            "--all-clusters",
+            action="store_true",
+            help="report singleton and weakly supported clusters too",
+        )
+        sweep_parser.add_argument(
+            "--show-approximants",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="show every selected root in the table output",
+        )
+        sweep_parser.add_argument(
+            "--output", choices=("table", "json", "csv"), default="table"
+        )
+        sweep_parser.add_argument("--verbose", action="store_true")
+        _backend_arguments(sweep_parser)
+
     sweep_parser = subparsers.add_parser(
+        "sweep", help="generate and analyse a balanced family of approximants"
+    )
+    sweep_parser.add_argument("path", type=Path, help="coefficient file")
+    sweep_parser.add_argument(
+        "--format", choices=("plain", "legacy"), default="plain"
+    )
+    add_sweep_arguments(sweep_parser, generated=True)
+    sweep_parser.set_defaults(handler=_modern_sweep_command)
+
+    legacy_sweep_parser = subparsers.add_parser(
         "legacy-sweep", help="run the approximant family encoded in a legacy input"
     )
-    sweep_parser.add_argument("path", type=Path)
-    sweep_parser.add_argument("--imaginary-tolerance", type=float, default=1.0e-8)
-    sweep_parser.add_argument(
-        "--root-min",
-        type=float,
-        default=0.0,
-        help="lower end of the physical-root interval",
+    legacy_sweep_parser.add_argument("path", type=Path)
+    add_sweep_arguments(legacy_sweep_parser, generated=False)
+    legacy_sweep_parser.set_defaults(
+        handler=_legacy_sweep_command,
+        orders=(1, 2),
+        p_degrees=None,
+        degree_spread=2,
+        max_terms_omitted=None,
+        root_min=0.0,
+        root_max=math.inf,
+        show_approximants=True,
     )
-    sweep_parser.add_argument(
-        "--root-max",
-        type=float,
-        default=math.inf,
-        help="upper end of the physical-root interval",
-    )
-    sweep_parser.add_argument("--verbose", action="store_true")
-    _backend_arguments(sweep_parser)
-    sweep_parser.set_defaults(handler=_sweep_command)
     return parser
 
 

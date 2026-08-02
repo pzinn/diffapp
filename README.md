@@ -26,6 +26,8 @@ Run directly from a checkout:
 
 ```console
 PYTHONPATH=src python -m diffapp fit coefficients.txt
+PYTHONPATH=src python -m diffapp sweep coefficients.txt \
+  --root-min 0.2 --root-max 0.3
 PYTHONPATH=src python -m diffapp fit zinn.dat --format legacy \
   --q-degrees 5,5 --p-degree 1
 PYTHONPATH=src python -m diffapp legacy-sweep zinn.dat \
@@ -37,9 +39,55 @@ precision.  The default `float64` backend equilibrates rows and columns before
 calling SciPy's LAPACK solver and reports the scaled condition number and
 backward residual.
 
-For a sweep, specifying a physical-root interval is important: an approximant
-often has several positive real roots, and the closest one need not represent
-the singularity under study.
+## Sweeps
+
+The modern `sweep` command is independent of the input-file format. By default
+it examines first- and second-order equations, varies `P` from degree zero up
+to a modest length-dependent maximum, balances the `Q` degrees to within two,
+and uses all or nearly all the available coefficients. It rejects numerically
+rank-deficient fits, groups nearby roots, and reports clusters occurring in at
+least half the accepted approximants.
+
+Specifying a physical-root interval is important when its approximate location
+is known:
+
+```console
+PYTHONPATH=src python -m diffapp sweep coefficients.txt \
+  --root-min 0.2 --root-max 0.3
+```
+
+With an interval, each approximant contributes its nearest-origin almost-real
+root in that interval. Without one, every root is considered and clustered.
+An approximant often has several positive real roots, and mathematics alone
+does not decide which represents the singularity under study.
+
+The main controls are:
+
+- `--orders 1,2` accepts comma-separated orders or inclusive ranges such as
+  `1:3`.
+- `--p-degrees -1,0:4` overrides the automatic `P` range; `-1` denotes a
+  homogeneous equation.
+- `--degree-spread 2` limits the difference between the largest and smallest
+  `Q` degree.
+- `--max-terms-omitted 10` controls how far below the full series length the
+  generated fits may go.
+- `--cluster-tolerance 1e-4` sets the hybrid relative distance used to group
+  roots, and `--minimum-cluster-fraction 0.5` sets the recurring threshold.
+- `--show-approximants` adds the individual roots, exponents, condition
+  numbers, and combined cancellation score to the default cluster table.
+- `--all-clusters` also displays weakly supported and singleton clusters.
+- `--output json` and `--output csv` provide structured output for subsequent
+  analysis.
+
+For `N` coefficients, the automatic `P` degrees are
+`0..min(8, max(1, floor(N/3)))`. The default family omits at most
+`min(10, N-3)` trailing coefficients. These are deliberately broad exploratory
+defaults; a known root interval and a narrower degree range usually give a
+more interpretable scientific comparison.
+
+`legacy-sweep` remains available, but only its degree family comes from the
+legacy control line. Those specifications now pass through the same fitting,
+rank checks, root selection, clustering, and output machinery as `sweep`.
 
 For a single fit, `Q` and `P` degrees are optional. The automatic choice uses
 all available coefficients, normally selects a second-order equation with
