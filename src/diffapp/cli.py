@@ -6,7 +6,9 @@ import argparse
 import csv
 import json
 import math
+import statistics
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +19,9 @@ from .core import (
     fit_differential_approximant,
     required_coefficients,
 )
+from .extension import ExtensionSweepResult, extend_sweep
 from .io import read_legacy_dataset, read_plain_coefficients
-from .model import ApproximantError, Singularity
+from .model import ApproximantError, DifferentialApproximant, Singularity
 from .sweep import (
     RootCluster,
     SweepConfig,
@@ -70,12 +73,17 @@ def _backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--digits", type=int, default=12, help="displayed significant digits")
 
 
-def _fit_command(arguments: argparse.Namespace) -> int:
-    coefficients = (
+def _read_coefficients(arguments: argparse.Namespace) -> tuple[Any, ...]:
+    return (
         read_legacy_dataset(arguments.path).coefficients
         if arguments.format == "legacy"
         else read_plain_coefficients(arguments.path)
     )
+
+
+def _fit_requested_approximant(
+    coefficients: tuple[Any, ...], arguments: argparse.Namespace
+) -> tuple[DifferentialApproximant, bool]:
     automatic = arguments.q_degrees is None
     if automatic:
         approximant = fit_default_differential_approximant(
@@ -85,8 +93,6 @@ def _fit_command(arguments: argparse.Namespace) -> int:
             backend=arguments.backend,
             precision_digits=arguments.precision,
         )
-        q_degrees = approximant.q_degrees
-        p_degree = approximant.p_degree
     else:
         if arguments.order is not None:
             raise ApproximantError("--order cannot be combined with --q-degrees")
@@ -104,9 +110,16 @@ def _fit_command(arguments: argparse.Namespace) -> int:
             backend=arguments.backend,
             precision_digits=arguments.precision,
         )
+    return approximant, automatic
+
+
+def _fit_command(arguments: argparse.Namespace) -> int:
+    coefficients = _read_coefficients(arguments)
+    approximant, automatic = _fit_requested_approximant(coefficients, arguments)
     if automatic:
         print(
-            f"automatic specification: Q degrees {q_degrees}, P degree {p_degree}"
+            f"automatic specification: Q degrees {approximant.q_degrees}, "
+            f"P degree {approximant.p_degree}"
         )
     print(
         f"order {approximant.order}, Q degrees {approximant.q_degrees}, "
@@ -135,6 +148,117 @@ def _fit_command(arguments: argparse.Namespace) -> int:
         print(f"warning: {warning}")
     for singularity in approximant.singularities():
         print(_describe_singularity(singularity, arguments.digits))
+    return 0
+
+
+def _backend_coefficient(value: Any, backend: str) -> Any:
+    return mp.mpf(str(value)) if backend == "mpmath" else float(value)
+
+
+def _extension_terms(arguments: argparse.Namespace, input_count: int) -> int:
+    return input_count + 10 if arguments.terms is None else arguments.terms
+
+
+def _single_extension_command(arguments: argparse.Namespace) -> int:
+    coefficients = _read_coefficients(arguments)
+    total_coefficients = _extension_terms(arguments, len(coefficients))
+    if total_coefficients <= len(coefficients):
+        raise ApproximantError(
+            f"--terms must exceed the {len(coefficients)} supplied coefficients"
+        )
+    approximant, automatic = _fit_requested_approximant(coefficients, arguments)
+    context = (
+        mp.workdps(arguments.precision)
+        if arguments.backend == "mpmath"
+        else nullcontext()
+    )
+    with context:
+        predicted = approximant.extend_series(total_coefficients)
+        supplied = tuple(
+            _backend_coefficient(value, arguments.backend)
+            for value in coefficients
+        )
+        combined = supplied + predicted[len(coefficients) :]
+        holdout_errors = [
+            float(
+                abs(predicted[index] - supplied[index])
+                / (1 + abs(supplied[index]))
+            )
+            for index in range(
+                approximant.coefficients_used, len(coefficients)
+            )
+        ]
+        holdout_median = (
+            float(statistics.median(holdout_errors))
+            if holdout_errors
+            else None
+        )
+        holdout_maximum = max(holdout_errors) if holdout_errors else None
+    first = len(coefficients) if arguments.predicted_only else 0
+
+    if arguments.output == "plain":
+        for value in combined[first:]:
+            print(_format_number(value, arguments.digits))
+        return 0
+    if arguments.output == "csv":
+        writer = csv.writer(sys.stdout)
+        writer.writerow(("index", "coefficient", "source"))
+        for index in range(first, len(combined)):
+            writer.writerow(
+                (
+                    index,
+                    _format_number(combined[index], arguments.digits),
+                    "input" if index < len(coefficients) else "extrapolated",
+                )
+            )
+        return 0
+    if arguments.output == "json":
+        payload = {
+            "specification": {
+                "automatic": automatic,
+                "order": approximant.order,
+                "q_degrees": list(approximant.q_degrees),
+                "p_degree": approximant.p_degree,
+                "coefficients_used": approximant.coefficients_used,
+            },
+            "holdout": {
+                "terms": len(holdout_errors),
+                "median_relative_error": holdout_median,
+                "maximum_relative_error": holdout_maximum,
+            },
+            "coefficients": [
+                {
+                    "index": index,
+                    "value": _finite_float(combined[index]),
+                    "source": (
+                        "input" if index < len(coefficients) else "extrapolated"
+                    ),
+                }
+                for index in range(first, len(combined))
+            ],
+        }
+        json.dump(payload, sys.stdout, indent=2, allow_nan=False)
+        print()
+        return 0
+
+    automatic_text = "automatic " if automatic else ""
+    print(
+        f"{automatic_text}order {approximant.order}, "
+        f"Q degrees {approximant.q_degrees}, P degree {approximant.p_degree}, "
+        f"coefficients used {approximant.coefficients_used}"
+    )
+    if holdout_errors:
+        print(
+            f"holdout validation: {len(holdout_errors)} terms, "
+            f"median relative error {holdout_median:.3e}, "
+            f"maximum {holdout_maximum:.3e}"
+        )
+    print(f"\n{'n':>6} {'coefficient':>24} {'source':>12}")
+    for index in range(first, len(combined)):
+        print(
+            f"{index:6d} {_format_number(combined[index], arguments.digits):>24} "
+            f"{'input' if index < len(coefficients) else 'extrapolated':>12}"
+        )
     return 0
 
 
@@ -435,6 +559,188 @@ def _legacy_sweep_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _extension_sweep_config(arguments: argparse.Namespace) -> SweepConfig:
+    return SweepConfig(
+        orders=arguments.orders,
+        p_degrees=arguments.p_degrees,
+        degree_spread=arguments.degree_spread,
+        max_terms_omitted=arguments.max_terms_omitted,
+        reject_rank_deficient=not arguments.include_rank_deficient,
+    )
+
+
+def _extension_forecast_record(forecast: Any) -> dict[str, Any]:
+    return {
+        "index": forecast.index,
+        "median": _finite_float(forecast.median),
+        "median_absolute_deviation": _finite_float(
+            forecast.median_absolute_deviation
+        ),
+        "relative_spread": forecast.relative_spread,
+        "minimum": _finite_float(forecast.minimum),
+        "maximum": _finite_float(forecast.maximum),
+        "support": forecast.support,
+    }
+
+
+def _write_extension_sweep_table(
+    result: ExtensionSweepResult, arguments: argparse.Namespace
+) -> None:
+    print(
+        f"{len(result.specifications)} specifications: "
+        f"{len(result.estimates)} extended, {len(result.rejections)} rejected; "
+        f"{result.validated_estimate_count} holdout-validated"
+    )
+    if arguments.show_models:
+        print("\nExtension models:")
+        print(
+            f"{'Q degrees':>18} {'P':>3} {'used':>6} {'holdout':>8} "
+            f"{'median error':>13} {'max error':>13} {'condition':>12}"
+        )
+        for estimate in result.estimates:
+            median_error = (
+                "n/a"
+                if estimate.holdout_median_error is None
+                else f"{estimate.holdout_median_error:.2e}"
+            )
+            max_error = (
+                "n/a"
+                if estimate.holdout_max_error is None
+                else f"{estimate.holdout_max_error:.2e}"
+            )
+            condition = estimate.approximant.diagnostics.scaled_condition_number
+            condition_text = (
+                "n/a"
+                if condition is None or not math.isfinite(condition)
+                else f"{condition:.2e}"
+            )
+            print(
+                f"{str(estimate.specification.q_degrees):>18} "
+                f"{estimate.specification.p_degree:3d} "
+                f"{estimate.specification.coefficients_used:6d} "
+                f"{estimate.holdout_terms:8d} {median_error:>13} "
+                f"{max_error:>13} {condition_text:>12}"
+            )
+
+    print("\nEnsemble forecast:")
+    if not result.forecasts:
+        print("none")
+    else:
+        print(
+            f"{'n':>6} {'median':>24} {'MAD':>14} "
+            f"{'relative spread':>16} {'support':>9}"
+        )
+        for forecast in result.forecasts:
+            print(
+                f"{forecast.index:6d} "
+                f"{_format_number(forecast.median, arguments.digits):>24} "
+                f"{_format_number(forecast.median_absolute_deviation, arguments.digits):>14} "
+                f"{forecast.relative_spread:16.2e} {forecast.support:9d}"
+            )
+
+    if arguments.verbose and result.rejections:
+        print("\nRejected specifications:", file=sys.stderr)
+        for rejection in result.rejections:
+            detail = f": {rejection.detail}" if rejection.detail else ""
+            print(
+                f"Q={rejection.specification.q_degrees} "
+                f"P={rejection.specification.p_degree}: "
+                f"{rejection.reason}{detail}",
+                file=sys.stderr,
+            )
+
+
+def _write_extension_sweep_json(
+    result: ExtensionSweepResult, arguments: argparse.Namespace
+) -> None:
+    payload = {
+        "summary": {
+            "specifications": len(result.specifications),
+            "extended": len(result.estimates),
+            "rejected": len(result.rejections),
+            "holdout_validated": result.validated_estimate_count,
+            "input_coefficients": result.input_coefficient_count,
+            "total_coefficients": result.total_coefficient_count,
+        },
+        "forecasts": [
+            _extension_forecast_record(forecast)
+            for forecast in result.forecasts
+        ],
+        "models": [
+            {
+                **_specification_record(estimate.specification),
+                "holdout_terms": estimate.holdout_terms,
+                "holdout_median_relative_error": estimate.holdout_median_error,
+                "holdout_maximum_relative_error": estimate.holdout_max_error,
+                "condition_number": _finite_float(
+                    estimate.approximant.diagnostics.scaled_condition_number
+                ),
+            }
+            for estimate in result.estimates
+        ],
+        "rejections": [
+            {
+                **_specification_record(rejection.specification),
+                "reason": rejection.reason,
+                "detail": rejection.detail,
+            }
+            for rejection in result.rejections
+        ],
+    }
+    json.dump(payload, sys.stdout, indent=2, allow_nan=False)
+    print()
+
+
+def _write_extension_sweep_csv(
+    result: ExtensionSweepResult, arguments: argparse.Namespace
+) -> None:
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        (
+            "index",
+            "median",
+            "median_absolute_deviation",
+            "relative_spread",
+            "minimum",
+            "maximum",
+            "support",
+        )
+    )
+    for forecast in result.forecasts:
+        writer.writerow(
+            (
+                forecast.index,
+                _format_number(forecast.median, arguments.digits),
+                _format_number(
+                    forecast.median_absolute_deviation, arguments.digits
+                ),
+                forecast.relative_spread,
+                _format_number(forecast.minimum, arguments.digits),
+                _format_number(forecast.maximum, arguments.digits),
+                forecast.support,
+            )
+        )
+
+
+def _extension_sweep_command(arguments: argparse.Namespace) -> int:
+    coefficients = _read_coefficients(arguments)
+    result = extend_sweep(
+        coefficients,
+        _extension_terms(arguments, len(coefficients)),
+        _extension_sweep_config(arguments),
+        backend=arguments.backend,
+        precision_digits=arguments.precision,
+        maximum_holdout_error=arguments.maximum_holdout_error,
+    )
+    if arguments.output == "json":
+        _write_extension_sweep_json(result, arguments)
+    elif arguments.output == "csv":
+        _write_extension_sweep_csv(result, arguments)
+    else:
+        _write_extension_sweep_table(result, arguments)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="diffapp", description="Analyse power series with differential approximants"
@@ -465,6 +771,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _backend_arguments(fit_parser)
     fit_parser.set_defaults(handler=_fit_command)
+
+    extend_parser = subparsers.add_parser(
+        "extend", help="extend a series with one differential approximant"
+    )
+    extend_parser.add_argument("path", type=Path, help="coefficient file")
+    extend_parser.add_argument(
+        "--format", choices=("plain", "legacy"), default="plain"
+    )
+    extend_parser.add_argument(
+        "--q-degrees",
+        help="comma-separated degrees Q0,...,QM; default is automatic",
+    )
+    extend_parser.add_argument("--p-degree", type=int)
+    extend_parser.add_argument("--order", type=int)
+    extend_parser.add_argument(
+        "--terms",
+        type=int,
+        help="total coefficient count after extension (default: input count + 10)",
+    )
+    extend_parser.add_argument(
+        "--predicted-only",
+        action="store_true",
+        help="omit the supplied coefficients from output",
+    )
+    extend_parser.add_argument(
+        "--output",
+        choices=("table", "plain", "json", "csv"),
+        default="table",
+    )
+    _backend_arguments(extend_parser)
+    extend_parser.set_defaults(handler=_single_extension_command)
 
     def add_sweep_arguments(
         sweep_parser: argparse.ArgumentParser, *, generated: bool
@@ -545,6 +882,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_sweep_arguments(sweep_parser, generated=True)
     sweep_parser.set_defaults(handler=_modern_sweep_command)
+
+    extension_sweep_parser = subparsers.add_parser(
+        "extend-sweep",
+        help="extend with a family and summarize an ensemble forecast",
+    )
+    extension_sweep_parser.add_argument(
+        "path", type=Path, help="coefficient file"
+    )
+    extension_sweep_parser.add_argument(
+        "--format", choices=("plain", "legacy"), default="plain"
+    )
+    extension_sweep_parser.add_argument(
+        "--terms",
+        type=int,
+        help="total coefficient count after extension (default: input count + 10)",
+    )
+    extension_sweep_parser.add_argument(
+        "--orders",
+        type=_integer_selection,
+        default=(1, 2),
+        help="equation orders (default: 1,2)",
+    )
+    extension_sweep_parser.add_argument(
+        "--p-degrees",
+        type=_integer_selection,
+        help="P degrees, e.g. 0:8 or -1,0,1 (default: automatic range)",
+    )
+    extension_sweep_parser.add_argument(
+        "--degree-spread", type=int, default=2
+    )
+    extension_sweep_parser.add_argument(
+        "--max-terms-omitted", type=int
+    )
+    extension_sweep_parser.add_argument(
+        "--maximum-holdout-error",
+        type=float,
+        help="reject models exceeding this normalized holdout error",
+    )
+    extension_sweep_parser.add_argument(
+        "--include-rank-deficient", action="store_true"
+    )
+    extension_sweep_parser.add_argument(
+        "--show-models",
+        action="store_true",
+        help="show each model's holdout and condition diagnostics",
+    )
+    extension_sweep_parser.add_argument(
+        "--output", choices=("table", "json", "csv"), default="table"
+    )
+    extension_sweep_parser.add_argument("--verbose", action="store_true")
+    _backend_arguments(extension_sweep_parser)
+    extension_sweep_parser.set_defaults(handler=_extension_sweep_command)
 
     legacy_sweep_parser = subparsers.add_parser(
         "legacy-sweep", help="run the approximant family encoded in a legacy input"

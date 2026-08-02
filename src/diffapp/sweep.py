@@ -94,6 +94,24 @@ class SweepRejection:
 
 
 @dataclass(frozen=True)
+class SweepFit:
+    """One successfully fitted member of a sweep family."""
+
+    specification: SweepSpecification
+    approximant: DifferentialApproximant
+
+
+@dataclass(frozen=True)
+class FitSweepResult:
+    """Approximants accepted before any root-specific analysis."""
+
+    config: SweepConfig
+    specifications: tuple[SweepSpecification, ...]
+    fits: tuple[SweepFit, ...]
+    rejections: tuple[SweepRejection, ...]
+
+
+@dataclass(frozen=True)
 class RootCluster:
     """A recurring root and descriptive spread across approximants."""
 
@@ -287,15 +305,15 @@ def _cluster_estimates(
     )
 
 
-def run_sweep(
+def fit_sweep(
     coefficients: Sequence[Any],
     config: SweepConfig = SweepConfig(),
     *,
     specifications: Sequence[SweepSpecification] | None = None,
     backend: Backend = "float64",
     precision_digits: int = 80,
-) -> SweepResult:
-    """Fit a family of approximants and cluster their candidate roots."""
+) -> FitSweepResult:
+    """Fit a family of approximants with common rank and size checks."""
 
     config.validated(len(coefficients))
     selected_specifications = tuple(
@@ -305,7 +323,7 @@ def run_sweep(
             else generate_sweep_specifications(len(coefficients), config)
         )
     )
-    estimates: list[SweepEstimate] = []
+    fits: list[SweepFit] = []
     rejections: list[SweepRejection] = []
     for specification in selected_specifications:
         if specification.coefficients_used > len(coefficients):
@@ -335,19 +353,57 @@ def run_sweep(
                     )
                 )
                 continue
-            singularities = _selected_singularities(approximant, config)
         except ApproximantError as error:
             rejections.append(
                 SweepRejection(specification, "fit-failed", str(error))
             )
             continue
+        fits.append(SweepFit(specification, approximant))
+
+    return FitSweepResult(
+        config=config,
+        specifications=selected_specifications,
+        fits=tuple(fits),
+        rejections=tuple(rejections),
+    )
+
+
+def run_sweep(
+    coefficients: Sequence[Any],
+    config: SweepConfig = SweepConfig(),
+    *,
+    specifications: Sequence[SweepSpecification] | None = None,
+    backend: Backend = "float64",
+    precision_digits: int = 80,
+) -> SweepResult:
+    """Fit a family of approximants and cluster their candidate roots."""
+
+    fitted = fit_sweep(
+        coefficients,
+        config,
+        specifications=specifications,
+        backend=backend,
+        precision_digits=precision_digits,
+    )
+    estimates: list[SweepEstimate] = []
+    rejections = list(fitted.rejections)
+    for fit in fitted.fits:
+        try:
+            singularities = _selected_singularities(fit.approximant, config)
+        except ApproximantError as error:
+            rejections.append(
+                SweepRejection(
+                    fit.specification, "root-analysis-failed", str(error)
+                )
+            )
+            continue
         if not singularities:
             rejections.append(
-                SweepRejection(specification, "no-selected-root")
+                SweepRejection(fit.specification, "no-selected-root")
             )
             continue
         estimates.extend(
-            SweepEstimate(specification, approximant, singularity)
+            SweepEstimate(fit.specification, fit.approximant, singularity)
             for singularity in singularities
         )
 
@@ -360,7 +416,7 @@ def run_sweep(
     )
     return SweepResult(
         config=config,
-        specifications=selected_specifications,
+        specifications=fitted.specifications,
         estimates=tuple(estimates),
         rejections=tuple(rejections),
         clusters=clusters,

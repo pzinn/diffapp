@@ -12,6 +12,7 @@ from diffapp import (
     SweepConfig,
     SweepSpecification,
     default_p_degrees,
+    extend_sweep,
     generate_sweep_specifications,
     read_plain_coefficients,
     run_sweep,
@@ -115,6 +116,89 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["specifications"], 12)
         self.assertGreater(payload["summary"]["accepted"], 0)
         self.assertEqual(payload["summary"]["recurring_clusters"], 1)
+
+    def test_extension_sweep_uses_holdouts_and_recovers_coefficients(self) -> None:
+        coefficients = [math.comb(n + 2, 2) * 4**n for n in range(8)]
+        result = extend_sweep(
+            coefficients,
+            11,
+            SweepConfig(root_interval=None),
+        )
+        self.assertGreater(len(result.estimates), 1)
+        self.assertGreater(result.validated_estimate_count, 0)
+        expected = [math.comb(n + 2, 2) * 4**n for n in range(8, 11)]
+        self.assertEqual([item.index for item in result.forecasts], [8, 9, 10])
+        for forecast, value in zip(result.forecasts, expected, strict=True):
+            self.assertAlmostEqual(float(forecast.median), value, places=5)
+            self.assertLess(forecast.relative_spread, 1.0e-10)
+
+    def test_single_extension_cli_can_emit_only_predictions(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = main(
+                [
+                    "extend",
+                    "coefficients.txt",
+                    "--terms",
+                    "14",
+                    "--predicted-only",
+                    "--output",
+                    "plain",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            [float(line) for line in output.getvalue().splitlines()],
+            [1526726656.0, 7046430720.0],
+        )
+
+    def test_extension_cli_defaults_to_ten_additional_terms(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = main(
+                [
+                    "extend",
+                    "coefficients.txt",
+                    "--predicted-only",
+                    "--output",
+                    "plain",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(output.getvalue().splitlines()), 10)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = main(
+                ["extend-sweep", "coefficients.txt", "--output", "json"]
+            )
+        self.assertEqual(status, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["summary"]["input_coefficients"], 12)
+        self.assertEqual(payload["summary"]["total_coefficients"], 22)
+        self.assertEqual(len(payload["forecasts"]), 10)
+
+    def test_extension_sweep_cli_json_is_machine_readable(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = main(
+                [
+                    "extend-sweep",
+                    "coefficients.txt",
+                    "--terms",
+                    "14",
+                    "--output",
+                    "json",
+                ]
+            )
+        self.assertEqual(status, 0)
+        payload = json.loads(output.getvalue())
+        self.assertGreater(payload["summary"]["extended"], 1)
+        self.assertGreater(payload["summary"]["holdout_validated"], 0)
+        self.assertEqual(
+            [forecast["index"] for forecast in payload["forecasts"]],
+            [12, 13],
+        )
 
 
 if __name__ == "__main__":

@@ -26,8 +26,10 @@ Run directly from a checkout:
 
 ```console
 PYTHONPATH=src python -m diffapp fit coefficients.txt
+PYTHONPATH=src python -m diffapp extend coefficients.txt --terms 30
 PYTHONPATH=src python -m diffapp sweep coefficients.txt \
   --root-min 0.2 --root-max 0.3
+PYTHONPATH=src python -m diffapp extend-sweep coefficients.txt --terms 30
 PYTHONPATH=src python -m diffapp fit zinn.dat --format legacy \
   --q-degrees 5,5 --p-degree 1
 PYTHONPATH=src python -m diffapp legacy-sweep zinn.dat \
@@ -88,6 +90,48 @@ more interpretable scientific comparison.
 `legacy-sweep` remains available, but only its degree family comes from the
 legacy control line. Those specifications now pass through the same fitting,
 rank checks, root selection, clustering, and output machinery as `sweep`.
+
+## Extending a series
+
+`extend` uses one approximant's recurrence to extrapolate a series. By default
+it generates ten additional coefficients. `--terms` overrides this with the
+desired total coefficient count, including the supplied coefficients:
+
+```console
+PYTHONPATH=src python -m diffapp extend coefficients.txt --terms 30
+```
+
+The default table distinguishes supplied and extrapolated coefficients. Use
+`--predicted-only` to omit the supplied prefix, or select `--output plain`,
+`json`, or `csv`. The command accepts the same `--q-degrees`, `--p-degree`,
+`--order`, and numerical-backend options as `fit`.
+
+An automatic fit can fall back to fewer coefficients when a larger system is
+rank deficient. In that case `extend` predicts the unused, known coefficients
+and reports their normalized holdout error, but preserves their supplied
+values in the output. This is a useful check on the recurrence before using it
+beyond the known series.
+
+`extend-sweep` applies the same idea to a balanced family:
+
+```console
+PYTHONPATH=src python -m diffapp extend-sweep coefficients.txt --terms 30 \
+  --show-models
+```
+
+It also defaults to ten additional coefficients when `--terms` is omitted.
+
+For each new coefficient it reports the ensemble median, median absolute
+deviation (`MAD`), relative spread, and number of contributing models. Models
+that omit trailing input coefficients are scored against those holdouts.
+`--maximum-holdout-error` can reject models above a chosen normalized error;
+models using every supplied coefficient have no holdout score. Rank-deficient
+models are rejected by default, as in a root sweep. JSON and CSV output are
+also available.
+
+Extension is extrapolation, not additional data. Agreement across the family
+and small holdout errors are useful diagnostics, but uncertainty can grow very
+quickly with the distance beyond the known coefficients.
 
 For a single fit, `Q` and `P` degrees are optional. The automatic choice uses
 all available coefficients, normally selects a second-order equation with
