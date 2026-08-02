@@ -165,7 +165,12 @@ def _float64_fit(
         raise SingularSystemError("the defining linear system is singular") from error
     solution = scaled_solution / column_scales
 
-    condition = float(np.linalg.cond(scaled_matrix))
+    singular_values = np.linalg.svd(scaled_matrix, compute_uv=False)
+    condition = float(singular_values[0] / singular_values[-1])
+    rank_tolerance = (
+        singular_values[0] * max(scaled_matrix.shape) * np.finfo(float).eps
+    )
+    numerical_rank = int(np.count_nonzero(singular_values > rank_tolerance))
     residual = matrix @ solution - rhs
     denominator = (
         np.linalg.norm(matrix, ord=np.inf) * np.linalg.norm(solution, ord=np.inf)
@@ -181,6 +186,18 @@ def _float64_fit(
         captured.append(
             f"scaled system is ill-conditioned (condition number {condition:.3e})"
         )
+    if numerical_rank < size:
+        captured.append(
+            f"scaled system is numerically rank deficient "
+            f"(rank {numerical_rank} of {size}); fitted roots may depend on precision"
+        )
+    coefficient_zero_tolerance = min(
+        0.1,
+        max(
+            100 * np.finfo(float).eps,
+            10 * condition * np.finfo(float).eps,
+        ),
+    )
     diagnostics = FitDiagnostics(
         backend="float64",
         precision_digits=15,
@@ -188,6 +205,8 @@ def _float64_fit(
         scaled_condition_number=condition,
         relative_residual=relative_residual,
         estimated_stable_digits=stable_digits,
+        numerical_rank=numerical_rank,
+        coefficient_zero_tolerance=coefficient_zero_tolerance,
         warnings=tuple(captured),
     )
     return solution.tolist(), diagnostics
@@ -258,13 +277,55 @@ def _mpmath_fit(
         rhs_norm = max(abs(rhs[row]) for row in range(size))
         denominator = matrix_norm * solution_norm + rhs_norm
         relative_residual = float(residual_norm / denominator) if denominator else 0.0
+        captured: list[str] = []
+        try:
+            singular_values = mp.svd(scaled_matrix, compute_uv=False)
+            largest = singular_values[0]
+            smallest = singular_values[size - 1]
+            condition_mp = largest / smallest if smallest else mp.inf
+            rank_tolerance = largest * size * mp.eps
+            numerical_rank = sum(
+                singular_values[index] > rank_tolerance for index in range(size)
+            )
+            try:
+                condition = float(condition_mp)
+            except (OverflowError, ValueError):
+                condition = math.inf
+            stable_digits = max(
+                0.0,
+                precision_digits - float(mp.log10(condition_mp)),
+            ) if condition_mp > 0 else None
+            coefficient_zero_tolerance = float(
+                min(
+                    mp.mpf("0.1"),
+                    max(100 * mp.eps, 10 * condition_mp * mp.eps),
+                )
+            )
+        except (ValueError, ZeroDivisionError):
+            condition = None
+            numerical_rank = None
+            stable_digits = None
+            coefficient_zero_tolerance = float(mp.power(10, 4 - precision_digits))
+            captured.append("unable to estimate arbitrary-precision matrix rank")
+        if condition is not None and condition > 10 ** (precision_digits / 2):
+            captured.append(
+                f"scaled system is ill-conditioned (condition number {condition:.3e})"
+            )
+        if numerical_rank is not None and numerical_rank < size:
+            captured.append(
+                f"scaled system is numerically rank deficient "
+                f"(rank {numerical_rank} of {size}); fitted roots may depend on precision"
+            )
         diagnostics = FitDiagnostics(
             backend="mpmath",
             precision_digits=precision_digits,
             equations=size,
-            scaled_condition_number=None,
+            scaled_condition_number=condition,
             relative_residual=relative_residual,
-            estimated_stable_digits=None,
+            estimated_stable_digits=stable_digits,
+            numerical_rank=numerical_rank,
+            coefficient_zero_tolerance=coefficient_zero_tolerance,
+            warnings=tuple(captured),
         )
         return solution, diagnostics
 
@@ -369,13 +430,20 @@ def fit_default_differential_approximant(
             continue
         tried.add(specification)
         try:
-            return fit_differential_approximant(
+            approximant = fit_differential_approximant(
                 coefficients,
                 q_degrees,
                 selected_p_degree,
                 backend=backend,
                 precision_digits=precision_digits,
             )
+            rank = approximant.diagnostics.numerical_rank
+            if rank is not None and rank < approximant.diagnostics.equations:
+                last_error = SingularSystemError(
+                    "automatic approximant is numerically rank deficient"
+                )
+                continue
+            return approximant
         except SingularSystemError as error:
             last_error = error
     if last_error is not None:

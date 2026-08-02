@@ -103,8 +103,23 @@ def _fit_command(arguments: argparse.Namespace) -> int:
         f"P degree {approximant.p_degree}, coefficients used {approximant.coefficients_used}"
     )
     diagnostics = approximant.diagnostics
+    effective_degrees = (
+        approximant.effective_q_degrees,
+        approximant.effective_p_degree,
+    )
+    nominal_degrees = (approximant.q_degrees, approximant.p_degree)
+    if effective_degrees != nominal_degrees:
+        print(
+            f"effective degrees: Q {approximant.effective_q_degrees}, "
+            f"P {approximant.effective_p_degree} "
+            f"(relative cutoff {diagnostics.coefficient_zero_tolerance:.2e})"
+        )
     if diagnostics.scaled_condition_number is not None:
         print(f"scaled condition number: {diagnostics.scaled_condition_number:.3e}")
+    if diagnostics.numerical_rank is not None:
+        print(
+            f"numerical rank: {diagnostics.numerical_rank}/{diagnostics.equations}"
+        )
     print(f"relative residual: {diagnostics.relative_residual:.3e}")
     for warning in diagnostics.warnings:
         print(f"warning: {warning}")

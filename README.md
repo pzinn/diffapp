@@ -64,6 +64,14 @@ Values near zero support a removable common factor. They should be interpreted
 alongside the fit condition number; an ill-conditioned fit may not determine
 its polynomial coefficients accurately enough for a reliable verdict.
 
+The fit also estimates numerical rank. Automatic fitting rejects
+rank-deficient specifications and tries a smaller balanced approximant.
+Explicit fits retain the requested specification but print a warning that
+their roots may depend on working precision. Leading coefficients below the
+reported uncertainty-based relative cutoff are omitted when calculating
+effective polynomial degrees and roots; nominal fitted coefficients remain
+available unchanged through the Python API.
+
 The legacy reader preserves decimal input values until the numerical backend
 has been chosen.  It supports the compact format used by `zinn.dat`,
 `test.dat`, and `orbvar.dat`; fixed-column card-deck input and biased

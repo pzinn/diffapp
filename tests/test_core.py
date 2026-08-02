@@ -43,6 +43,23 @@ class DifferentialApproximantTests(unittest.TestCase):
         self.assertGreater(physical.common_factor_residual, 1.0e-2)
         self.assertGreater(physical.common_root_distance, 1.0e-2)
 
+    def test_singularities_are_ordered_by_distance_from_origin(self) -> None:
+        approximant = DifferentialApproximant(
+            q=((1.0,), (-6.0, 1.0, 1.0)),
+            p=(),
+            input_coefficients=(1.0,),
+            diagnostics=FitDiagnostics(
+                backend="float64",
+                precision_digits=15,
+                equations=1,
+                scaled_condition_number=1.0,
+                relative_residual=0.0,
+                estimated_stable_digits=15.0,
+            ),
+        )
+        roots = [complex(item.root).real for item in approximant.singularities()]
+        self.assertEqual(roots, [2.0, -3.0])
+
     def test_default_specifications(self) -> None:
         self.assertEqual(default_specification(23), ((7, 6, 6), 1))
         self.assertEqual(default_specification(12), ((3, 3, 2), 1))
@@ -97,6 +114,36 @@ class DifferentialApproximantTests(unittest.TestCase):
         assert singularity is not None
         self.assertAlmostEqual(float(singularity.root), 0.25, places=14)
         self.assertAlmostEqual(float(singularity.exponent), -3.0, places=14)
+
+    def test_rank_deficiency_and_effective_degree_diagnostics(self) -> None:
+        coefficients = read_plain_coefficients("coefficients.txt")
+        approximant = fit_differential_approximant(
+            coefficients,
+            q_degrees=(3, 3, 2),
+            p_degree=1,
+            backend="mpmath",
+            precision_digits=80,
+        )
+        self.assertLess(
+            approximant.diagnostics.numerical_rank,
+            approximant.diagnostics.equations,
+        )
+        self.assertEqual(approximant.effective_p_degree, 0)
+        self.assertTrue(
+            all(
+                math.isinf(singularity.common_root_distance)
+                for singularity in approximant.singularities()
+            )
+        )
+
+        automatic = fit_default_differential_approximant(
+            coefficients, backend="mpmath", precision_digits=80
+        )
+        self.assertEqual(automatic.diagnostics.numerical_rank, 4)
+        self.assertEqual(len(automatic.singularities()), 1)
+        self.assertAlmostEqual(
+            float(automatic.singularities()[0].root), 0.25, places=14
+        )
 
     def test_zinn_legacy_input(self) -> None:
         dataset = read_legacy_dataset("zinn.dat")

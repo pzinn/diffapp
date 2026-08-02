@@ -32,6 +32,8 @@ class FitDiagnostics:
     scaled_condition_number: float | None
     relative_residual: float
     estimated_stable_digits: float | None
+    numerical_rank: int | None = None
+    coefficient_zero_tolerance: float = 0.0
     warnings: tuple[str, ...] = ()
 
 
@@ -99,9 +101,16 @@ def _normalized_polynomial_residual(
     return float(numerator / denominator)
 
 
-def _trim_polynomial(coefficients: Sequence[Scalar]) -> tuple[Scalar, ...]:
+def _trim_polynomial(
+    coefficients: Sequence[Scalar], relative_tolerance: float = 0.0
+) -> tuple[Scalar, ...]:
     result = list(coefficients)
-    while result and result[-1] == 0:
+    if not result:
+        return ()
+    scale = max(abs(value) for value in result)
+    if scale == 0:
+        return ()
+    while result and abs(result[-1]) <= relative_tolerance * scale:
         result.pop()
     return tuple(result)
 
@@ -175,13 +184,30 @@ class DifferentialApproximant:
         return len(self.p) - 1
 
     @property
+    def effective_q_degrees(self) -> tuple[int, ...]:
+        tolerance = self.diagnostics.coefficient_zero_tolerance
+        return tuple(
+            len(_trim_polynomial(polynomial, tolerance)) - 1
+            for polynomial in self.q
+        )
+
+    @property
+    def effective_p_degree(self) -> int:
+        return len(
+            _trim_polynomial(
+                self.p, self.diagnostics.coefficient_zero_tolerance
+            )
+        ) - 1
+
+    @property
     def coefficients_used(self) -> int:
         return self.diagnostics.equations
 
     def singularities(self) -> tuple[Singularity, ...]:
         """Return roots of the head polynomial and simple-root exponents."""
 
-        head = self.q[-1]
+        coefficient_tolerance = self.diagnostics.coefficient_zero_tolerance
+        head = _trim_polynomial(self.q[-1], coefficient_tolerance)
         if len(head) <= 1:
             return ()
 
@@ -203,24 +229,32 @@ class DifferentialApproximant:
                 tolerance = mp.power(
                     10, -max(12, self.diagnostics.precision_digits // 2)
                 )
-                return self._analyse_roots(roots, tolerance)
+                return self._analyse_roots(roots, tolerance, head)
 
         roots = list(np.polynomial.polynomial.polyroots(np.asarray(head)))
-        return self._analyse_roots(roots, 1.0e-10)
+        return self._analyse_roots(roots, 1.0e-10, head)
 
     def _analyse_roots(
-        self, roots: list[Scalar], tolerance: Scalar
+        self,
+        roots: list[Scalar],
+        tolerance: Scalar,
+        head: Sequence[Scalar],
     ) -> tuple[Singularity, ...]:
-        head = self.q[-1]
+        coefficient_tolerance = self.diagnostics.coefficient_zero_tolerance
         labelled_polynomials = [
-            (f"Q{index}", polynomial)
+            (
+                f"Q{index}",
+                _trim_polynomial(polynomial, coefficient_tolerance),
+            )
             for index, polynomial in enumerate(self.q[:-1])
         ]
-        labelled_polynomials.append(("P", self.p))
+        labelled_polynomials.append(
+            ("P", _trim_polynomial(self.p, coefficient_tolerance))
+        )
         labelled_polynomials = [
             (label, polynomial)
             for label, polynomial in labelled_polynomials
-            if _trim_polynomial(polynomial)
+            if polynomial
         ]
         other_polynomials = [polynomial for _, polynomial in labelled_polynomials]
         other_roots = [
@@ -236,8 +270,18 @@ class DifferentialApproximant:
         combined_gcd_score = (
             max(available_gcd_scores) if available_gcd_scores else None
         )
-        roots.sort(key=lambda root: (float(mp.re(root)), float(mp.im(root))))
-        lower = self.q[-2] if self.order >= 1 else None
+        roots.sort(
+            key=lambda root: (
+                float(abs(root)),
+                float(mp.re(root)),
+                float(mp.im(root)),
+            )
+        )
+        lower = (
+            _trim_polynomial(self.q[-2], coefficient_tolerance)
+            if self.order >= 1
+            else None
+        )
         singularities: list[Singularity] = []
         for root in roots:
             derivative = _polyder(head, root)
@@ -248,7 +292,8 @@ class DifferentialApproximant:
             is_simple = derivative_scale != 0 and abs(derivative) > tolerance * derivative_scale
             exponent = None
             if lower is not None and is_simple and root != 0:
-                exponent = self.order - 1 - _polyval(lower, root) / (root * derivative)
+                lower_value = _polyval(lower, root) if lower else 0
+                exponent = self.order - 1 - lower_value / (root * derivative)
             polynomial_residuals = [
                 _normalized_polynomial_residual(polynomial, root)
                 for polynomial in other_polynomials
