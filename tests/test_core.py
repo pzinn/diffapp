@@ -84,7 +84,8 @@ class DifferentialApproximantTests(unittest.TestCase):
         singularity = approximant.physical_singularity()
         self.assertIsNotNone(singularity)
         assert singularity is not None
-        self.assertEqual(approximant.coefficients_used, 4)
+        self.assertEqual(approximant.coefficients_used, 3)
+        self.assertEqual(approximant.diagnostics.holdout_terms, 3)
         self.assertAlmostEqual(complex(singularity.root).real, 0.5, places=13)
         self.assertAlmostEqual(complex(singularity.exponent).real, -1.0, places=13)
 
@@ -139,11 +140,46 @@ class DifferentialApproximantTests(unittest.TestCase):
         automatic = fit_default_differential_approximant(
             coefficients, backend="mpmath", precision_digits=80
         )
-        self.assertEqual(automatic.diagnostics.numerical_rank, 4)
+        self.assertEqual(automatic.diagnostics.numerical_rank, 3)
+        self.assertEqual(automatic.diagnostics.holdout_terms, 9)
         self.assertEqual(len(automatic.singularities()), 1)
         self.assertAlmostEqual(
             float(automatic.singularities()[0].root), 0.25, places=14
         )
+
+    def test_default_fit_selects_minimal_validated_first_order_model(self) -> None:
+        # F(x) = ((1 - 4x)(1 - 8x))^-1/2 satisfies a first-order
+        # homogeneous equation with Q degrees (2, 2).
+        coefficients = [
+            sum(
+                math.comb(2 * k, k)
+                * math.comb(2 * (n - k), n - k)
+                * 2 ** (n - k)
+                for k in range(n + 1)
+            )
+            for n in range(20)
+        ]
+        for backend in ("float64", "mpmath"):
+            approximant = fit_default_differential_approximant(
+                coefficients,
+                backend=backend,
+                precision_digits=80,
+            )
+            self.assertEqual(approximant.order, 1)
+            self.assertEqual(approximant.q_degrees, (2, 2))
+            self.assertEqual(approximant.p_degree, -1)
+            self.assertEqual(approximant.coefficients_used, 5)
+            self.assertEqual(approximant.diagnostics.holdout_terms, 15)
+            singularities = approximant.singularities()
+            self.assertEqual(len(singularities), 2)
+            self.assertAlmostEqual(float(singularities[0].root), 0.125, places=13)
+            self.assertAlmostEqual(float(singularities[1].root), 0.25, places=13)
+            self.assertAlmostEqual(
+                float(singularities[0].exponent), -0.5, places=12
+            )
+            self.assertAlmostEqual(
+                float(singularities[1].exponent), -0.5, places=12
+            )
 
     def test_zinn_legacy_input(self) -> None:
         dataset = read_legacy_dataset("zinn.dat")

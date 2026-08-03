@@ -34,6 +34,9 @@ class FitDiagnostics:
     estimated_stable_digits: float | None
     numerical_rank: int | None = None
     coefficient_zero_tolerance: float = 0.0
+    holdout_terms: int = 0
+    holdout_median_relative_error: float | None = None
+    holdout_maximum_relative_error: float | None = None
     warnings: tuple[str, ...] = ()
 
 
@@ -216,8 +219,7 @@ class DifferentialApproximant:
                 try:
                     roots = list(
                         mp.polyroots(
-                            list(head),
-                            asc=True,
+                            list(reversed(head)),
                             maxsteps=1000,
                             extraprec=max(20, self.diagnostics.precision_digits // 2),
                         )
@@ -360,8 +362,7 @@ class DifferentialApproximant:
             if self.diagnostics.backend == "mpmath":
                 return list(
                     mp.polyroots(
-                        list(coefficients),
-                        asc=True,
+                        list(reversed(coefficients)),
                         maxsteps=1000,
                         extraprec=max(
                             20, self.diagnostics.precision_digits // 2

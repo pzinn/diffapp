@@ -106,11 +106,10 @@ The default table distinguishes supplied and extrapolated coefficients. Use
 `json`, or `csv`. The command accepts the same `--q-degrees`, `--p-degree`,
 `--order`, and numerical-backend options as `fit`.
 
-An automatic fit can fall back to fewer coefficients when a larger system is
-rank deficient. In that case `extend` predicts the unused, known coefficients
-and reports their normalized holdout error, but preserves their supplied
-values in the output. This is a useful check on the recurrence before using it
-beyond the known series.
+An automatic fit deliberately reserves trailing coefficients for model
+selection. `extend` reports the selected model's normalized holdout error, but
+preserves the supplied values in its output. This checks the recurrence before
+using it beyond the known series.
 
 `extend-sweep` applies the same idea to a balanced family:
 
@@ -133,13 +132,19 @@ Extension is extrapolation, not additional data. Agreement across the family
 and small holdout errors are useful diagnostics, but uncertainty can grow very
 quickly with the distance beyond the known coefficients.
 
-For a single fit, `Q` and `P` degrees are optional. The automatic choice uses
-all available coefficients, normally selects a second-order equation with
-`P` degree 1, and distributes the `Q` degrees as evenly as possible. Short
-series fall back to a homogeneous or first-order approximant. Use `--order`
-to retain automatic degree balancing at a chosen differential-equation order.
-An automatic single fit is a convenient starting point, not a replacement for
-examining a family of nearby approximants.
+For a single fit, `Q` and `P` degrees are optional. Automatic selection tests
+balanced first- and second-order candidates with homogeneous, constant, and
+linear `P`. Each candidate is fitted to a prefix and asked to predict the
+unused trailing coefficients. The default minimizes the maximum normalized
+holdout error, preferring the simpler specification when errors differ only at
+the numerical-noise floor. The selected holdout count and errors are printed.
+Very short series, which cannot reserve a useful holdout, fall back to a
+full-length balanced fit.
+
+Use `--order` or `--p-degree` to restrict this validated search, or specify
+`--q-degrees` for one exact specification. An automatic single fit is a useful
+starting point, not a replacement for examining a family of nearby
+approximants.
 
 Each candidate singularity also has three cancellation diagnostics:
 

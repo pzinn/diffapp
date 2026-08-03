@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import statistics
 import warnings
 from collections.abc import Sequence
+from contextlib import nullcontext
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -409,12 +412,133 @@ def fit_default_differential_approximant(
     backend: Backend = "float64",
     precision_digits: int = 80,
 ) -> DifferentialApproximant:
-    """Fit the default balanced approximant, with singular-system fallback.
+    """Select a balanced approximant using trailing-coefficient validation.
 
-    The longest possible fit is tried first.  Exact lower-order series can
-    make an unnecessarily high-order system singular; in that case the
-    coefficient count is reduced until a nonsingular balanced fit is found.
+    First- and second-order candidates with several simple inhomogeneous
+    degrees are fitted to prefixes of the series.  Their recurrences predict
+    the unused trailing coefficients, and the candidate with the smallest
+    maximum normalized holdout error is returned. Explicit ``order`` or
+    ``p_degree`` values restrict that search. A full-length fallback remains
+    for series too short to reserve a useful holdout.
     """
+
+    coefficient_count = len(coefficients)
+    if coefficient_count < 3:
+        raise ApproximantError(
+            "at least three coefficients are needed for an automatic fit"
+        )
+    if order is not None and order < 1:
+        raise ApproximantError("automatic differential-equation order must be positive")
+    if p_degree is not None and p_degree < -1:
+        raise ApproximantError("P degree must be -1 (homogeneous) or non-negative")
+
+    orders = (order,) if order is not None else (1, 2)
+    p_degrees = (p_degree,) if p_degree is not None else (-1, 0, 1)
+    minimum_holdout = min(5, max(2, coefficient_count // 4))
+    maximum_used = coefficient_count - minimum_holdout
+    specifications: set[tuple[tuple[int, ...], int]] = set()
+    for used in range(3, maximum_used + 1):
+        for candidate_order in orders:
+            for candidate_p_degree in p_degrees:
+                assert candidate_order is not None
+                assert candidate_p_degree is not None
+                try:
+                    specifications.add(
+                        default_specification(
+                            used,
+                            order=candidate_order,
+                            p_degree=candidate_p_degree,
+                        )
+                    )
+                except ApproximantError:
+                    continue
+
+    validated: list[
+        tuple[float, float, int, int, int, DifferentialApproximant]
+    ] = []
+    context = (
+        mp.workdps(precision_digits) if backend == "mpmath" else nullcontext()
+    )
+    with context:
+        for q_degrees, candidate_p_degree in specifications:
+            try:
+                approximant = fit_differential_approximant(
+                    coefficients,
+                    q_degrees,
+                    candidate_p_degree,
+                    backend=backend,
+                    precision_digits=precision_digits,
+                )
+                rank = approximant.diagnostics.numerical_rank
+                if rank is not None and rank < approximant.diagnostics.equations:
+                    continue
+                predicted = approximant.extend_series(coefficient_count)
+            except (ApproximantError, OverflowError, ZeroDivisionError):
+                continue
+
+            errors: list[float] = []
+            for index in range(approximant.coefficients_used, coefficient_count):
+                actual = (
+                    _to_mpf(coefficients[index])
+                    if backend == "mpmath"
+                    else float(coefficients[index])
+                )
+                error = abs(predicted[index] - actual) / (1 + abs(actual))
+                if not mp.isfinite(error):
+                    errors = []
+                    break
+                errors.append(float(error))
+            if not errors:
+                continue
+            validated.append(
+                (
+                    max(errors),
+                    float(statistics.median(errors)),
+                    approximant.coefficients_used,
+                    approximant.order,
+                    max(0, approximant.p_degree + 1),
+                    approximant,
+                )
+            )
+
+    if validated:
+        best_error = min(item[0] for item in validated)
+        numerical_floor = (
+            1.0e-12
+            if backend == "float64"
+            else 10.0
+            ** -min(300, max(12, precision_digits - 10))
+        )
+        competitive = [
+            item
+            for item in validated
+            if item[0] <= max(numerical_floor, 1.05 * best_error)
+        ]
+        (
+            maximum_error,
+            median_error,
+            _,
+            _,
+            _,
+            approximant,
+        ) = min(
+            competitive,
+            key=lambda item: (
+                item[2],
+                item[3],
+                item[4],
+                item[0],
+                item[1],
+            ),
+        )
+        holdout_terms = coefficient_count - approximant.coefficients_used
+        diagnostics = replace(
+            approximant.diagnostics,
+            holdout_terms=holdout_terms,
+            holdout_median_relative_error=median_error,
+            holdout_maximum_relative_error=maximum_error,
+        )
+        return replace(approximant, diagnostics=diagnostics)
 
     last_error: SingularSystemError | None = None
     tried: set[tuple[tuple[int, ...], int]] = set()

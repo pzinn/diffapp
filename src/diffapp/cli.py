@@ -144,6 +144,13 @@ def _fit_command(arguments: argparse.Namespace) -> int:
             f"numerical rank: {diagnostics.numerical_rank}/{diagnostics.equations}"
         )
     print(f"relative residual: {diagnostics.relative_residual:.3e}")
+    if diagnostics.holdout_terms:
+        print(
+            f"holdout validation: {diagnostics.holdout_terms} terms, "
+            f"median relative error "
+            f"{diagnostics.holdout_median_relative_error:.3e}, "
+            f"maximum {diagnostics.holdout_maximum_relative_error:.3e}"
+        )
     for warning in diagnostics.warnings:
         print(f"warning: {warning}")
     for singularity in approximant.singularities():
